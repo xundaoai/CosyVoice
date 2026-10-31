@@ -119,16 +119,26 @@ class CosyVoiceModel:
                                                      embedding=llm_embedding.to(self.device),
                                                      uuid=uuid)
             for i in token_generator:
+                if uuid not in self.tts_speech_token_dict:
+                    # Session retired (consumer cancelled); stop decoding
+                    # instead of growing KV cache up to max_len.
+                    break
                 if i in self.silent_tokens:
                     cur_silent_token_num += 1
                     if cur_silent_token_num > max_silent_token_num:
                         continue
                 else:
                     cur_silent_token_num = 0
-                self.tts_speech_token_dict[uuid].append(i)
-        self.llm_end_dict[uuid] = True
+                try:
+                    self.tts_speech_token_dict[uuid].append(i)
+                except KeyError:
+                    break
+        if uuid in self.llm_end_dict:
+            self.llm_end_dict[uuid] = True
 
     def vc_job(self, source_speech_token, uuid):
+        if uuid not in self.llm_end_dict:
+            return
         self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist()
         self.llm_end_dict[uuid] = True
 
@@ -172,6 +182,19 @@ class CosyVoiceModel:
                 tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
         return tts_speech
 
+    def _maybe_release_gpu_cache(self):
+        """Release cached allocator blocks once no session is active.
+
+        Called when a session retires. An unconditional empty_cache on every
+        retirement serializes concurrent tts sessions (perf-1009), so only
+        the last retiring session pays the release cost; bursts keep the
+        cache warm and abandon paths can no longer pin GPU blocks forever.
+        """
+        with self.lock:
+            if self.hift_cache_dict:
+                return
+        torch.cuda.empty_cache()
+
     def tts(self, text=torch.zeros(1, 0, dtype=torch.int32), flow_embedding=torch.zeros(0, 192), llm_embedding=torch.zeros(0, 192),
             prompt_text=torch.zeros(1, 0, dtype=torch.int32),
             llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
@@ -188,7 +211,25 @@ class CosyVoiceModel:
             p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
         else:
             p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
+        # daemon: a cancelled session's decode thread must never block
+        # interpreter exit (llm_job self-terminates via the uuid guard).
+        p.daemon = True
         p.start()
+        try:
+            yield from self._tts_run(this_uuid, p, text, flow_embedding, prompt_text, llm_prompt_speech_token,
+                                     flow_prompt_speech_token, prompt_speech_feat, source_speech_token, stream, speed)
+        finally:
+            with self.lock:
+                self.tts_speech_token_dict.pop(this_uuid, None)
+                self.llm_end_dict.pop(this_uuid, None)
+                self.mel_overlap_dict.pop(this_uuid, None)
+                self.hift_cache_dict.pop(this_uuid, None)
+                self.flow_cache_dict.pop(this_uuid, None)
+            self._maybe_release_gpu_cache()
+
+    def _tts_run(self, this_uuid, p, text, flow_embedding, prompt_text, llm_prompt_speech_token,
+                 flow_prompt_speech_token, prompt_speech_feat, source_speech_token, stream, speed):
+        """Yield tts chunks for one session; assumes cleanup runs in caller's finally."""
         if stream is True:
             token_hop_len = self.token_min_hop_len
             while True:
@@ -231,15 +272,6 @@ class CosyVoiceModel:
                                              finalize=True,
                                              speed=speed)
             yield {'tts_speech': this_tts_speech.cpu()}
-        with self.lock:
-            self.tts_speech_token_dict.pop(this_uuid)
-            self.llm_end_dict.pop(this_uuid)
-            self.mel_overlap_dict.pop(this_uuid)
-            self.hift_cache_dict.pop(this_uuid)
-            self.flow_cache_dict.pop(this_uuid)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()
 
 
 class CosyVoice2Model(CosyVoiceModel):
@@ -339,7 +371,23 @@ class CosyVoice2Model(CosyVoiceModel):
             p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
         else:
             p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
+        # daemon: a cancelled session's decode thread must never block
+        # interpreter exit (llm_job self-terminates via the uuid guard).
+        p.daemon = True
         p.start()
+        try:
+            yield from self._tts_run(this_uuid, p, text, flow_embedding, prompt_text, llm_prompt_speech_token,
+                                     flow_prompt_speech_token, prompt_speech_feat, source_speech_token, stream, speed)
+        finally:
+            with self.lock:
+                self.tts_speech_token_dict.pop(this_uuid, None)
+                self.llm_end_dict.pop(this_uuid, None)
+                self.hift_cache_dict.pop(this_uuid, None)
+            self._maybe_release_gpu_cache()
+
+    def _tts_run(self, this_uuid, p, text, flow_embedding, prompt_text, llm_prompt_speech_token,
+                 flow_prompt_speech_token, prompt_speech_feat, source_speech_token, stream, speed):
+        """Yield tts chunks for one session; assumes cleanup runs in caller's finally."""
         if stream is True:
             token_offset = 0
             prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
@@ -385,13 +433,6 @@ class CosyVoice2Model(CosyVoiceModel):
                                              finalize=True,
                                              speed=speed)
             yield {'tts_speech': this_tts_speech.cpu()}
-        with self.lock:
-            self.tts_speech_token_dict.pop(this_uuid)
-            self.llm_end_dict.pop(this_uuid)
-            self.hift_cache_dict.pop(this_uuid)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()
 
 
 class CosyVoice3Model(CosyVoice2Model):
