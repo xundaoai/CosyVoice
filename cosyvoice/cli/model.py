@@ -119,28 +119,34 @@ class CosyVoiceModel:
                                                      embedding=llm_embedding.to(self.device),
                                                      uuid=uuid)
             for i in token_generator:
-                if uuid not in self.tts_speech_token_dict:
-                    # Session retired (consumer cancelled); stop decoding
-                    # instead of growing KV cache up to max_len.
-                    break
-                if i in self.silent_tokens:
-                    cur_silent_token_num += 1
-                    if cur_silent_token_num > max_silent_token_num:
-                        continue
-                else:
-                    cur_silent_token_num = 0
-                try:
+                # guard + append under self.lock: retire-side pops take the
+                # same lock, so a retired session can never be resurrected
+                with self.lock:
+                    if uuid not in self.tts_speech_token_dict:
+                        # Session retired (consumer cancelled); stop decoding
+                        # instead of growing KV cache up to max_len.
+                        break
+                    if i in self.silent_tokens:
+                        cur_silent_token_num += 1
+                        if cur_silent_token_num > max_silent_token_num:
+                            continue
+                    else:
+                        cur_silent_token_num = 0
                     self.tts_speech_token_dict[uuid].append(i)
-                except KeyError:
-                    break
-        if uuid in self.llm_end_dict:
-            self.llm_end_dict[uuid] = True
+        with self.lock:
+            if uuid in self.llm_end_dict:
+                self.llm_end_dict[uuid] = True
+        # the retiring session's release cannot reclaim blocks this thread
+        # still holds (KV tensors); release again once they are dropped
+        self._maybe_release_gpu_cache()
 
     def vc_job(self, source_speech_token, uuid):
-        if uuid not in self.llm_end_dict:
-            return
-        self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist()
-        self.llm_end_dict[uuid] = True
+        with self.lock:
+            if uuid not in self.llm_end_dict:
+                return
+            self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist()
+            self.llm_end_dict[uuid] = True
+        self._maybe_release_gpu_cache()
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, uuid, finalize=False, speed=1.0):
         with torch.cuda.amp.autocast(self.fp16):
@@ -390,10 +396,14 @@ class CosyVoice2Model(CosyVoiceModel):
         """Yield tts chunks for one session; assumes cleanup runs in caller's finally."""
         if stream is True:
             token_offset = 0
-            prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
+            # session-local hop length: mutating self.token_hop_len here
+            # leaks ramped-up values into every later session and delays
+            # their first chunk (PR#37 first-byte latency plateau)
+            token_hop_len = self.token_hop_len
+            prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / token_hop_len) * token_hop_len - flow_prompt_speech_token.shape[1])
             while True:
                 time.sleep(0.1)
-                this_token_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
+                this_token_hop_len = token_hop_len + prompt_token_pad if token_offset == 0 else token_hop_len
                 if len(self.tts_speech_token_dict[this_uuid]) - token_offset >= this_token_hop_len + self.flow.pre_lookahead_len:
                     this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_offset + this_token_hop_len + self.flow.pre_lookahead_len]).unsqueeze(dim=0)
                     this_tts_speech = self.token2wav(token=this_tts_speech_token,
@@ -405,7 +415,7 @@ class CosyVoice2Model(CosyVoiceModel):
                                                      stream=stream,
                                                      finalize=False)
                     token_offset += this_token_hop_len
-                    self.token_hop_len = min(self.token_max_hop_len, self.token_hop_len * self.stream_scale_factor)
+                    token_hop_len = min(self.token_max_hop_len, token_hop_len * self.stream_scale_factor)
                     yield {'tts_speech': this_tts_speech.cpu()}
                 if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) - token_offset < this_token_hop_len + self.flow.pre_lookahead_len:
                     break

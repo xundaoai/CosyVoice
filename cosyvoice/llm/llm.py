@@ -512,26 +512,33 @@ class Qwen2LM(TransformerLM):
             with self.lock:
                 self.vllm.add_request(uuid, {"prompt_embeds": lm_input.squeeze(0).to(torch.bfloat16).to(lm_input.device)}, sampling_params)
                 self.vllm_output_queue[uuid] = queue.Queue()
-            out_tokens = []
-            while True:
+            try:
+                out_tokens = []
+                while True:
+                    with self.lock:
+                        if self.vllm_output_queue[uuid].empty() is True:
+                            request_outputs: List[RequestOutput] = self.vllm.step()
+                            for request_output in request_outputs:
+                                top_ids = list(request_output.outputs[0].token_ids)[-1]
+                                self.vllm_output_queue[request_output.request_id].put(top_ids)
+                    if self.vllm_output_queue[uuid].empty() is False:
+                        top_ids = self.vllm_output_queue[uuid].get()
+                        if top_ids in self.stop_token_ids:
+                            break
+                        # in stream mode, yield token one by one
+                        yield top_ids
+                        out_tokens.append(top_ids)
+                        if len(out_tokens) == max_len:
+                            break
+                    time.sleep(0.001)
+            finally:
+                # an abandoned token generator (GeneratorExit) must still
+                # drop the queue entry and abort the engine request
                 with self.lock:
-                    if self.vllm_output_queue[uuid].empty() is True:
-                        request_outputs: List[RequestOutput] = self.vllm.step()
-                        for request_output in request_outputs:
-                            top_ids = list(request_output.outputs[0].token_ids)[-1]
-                            self.vllm_output_queue[request_output.request_id].put(top_ids)
-                if self.vllm_output_queue[uuid].empty() is False:
-                    top_ids = self.vllm_output_queue[uuid].get()
-                    if top_ids in self.stop_token_ids:
-                        break
-                    # in stream mode, yield token one by one
-                    yield top_ids
-                    out_tokens.append(top_ids)
-                    if len(out_tokens) == max_len:
-                        break
-                time.sleep(0.001)
-            with self.lock:
-                self.vllm_output_queue.pop(uuid)
+                    self.vllm_output_queue.pop(uuid, None)
+                    abort = getattr(self.vllm, 'abort_request', None)
+                    if abort is not None:
+                        abort(uuid)
         else:
             out_tokens = []
             cache = None
