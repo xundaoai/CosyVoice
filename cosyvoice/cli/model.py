@@ -118,29 +118,33 @@ class CosyVoiceModel:
                                                      prompt_speech_token_len=torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device),
                                                      embedding=llm_embedding.to(self.device),
                                                      uuid=uuid)
-            for i in token_generator:
-                # guard + append under self.lock: retire-side pops take the
-                # same lock, so a retired session can never be resurrected
+            try:
+                for i in token_generator:
+                    # guard + append under self.lock: retire-side pops take the
+                    # same lock, so a retired session can never be resurrected
+                    with self.lock:
+                        if uuid not in self.tts_speech_token_dict:
+                            # Session retired (consumer cancelled); stop decoding
+                            # instead of growing KV cache up to max_len.
+                            break
+                        if i in self.silent_tokens:
+                            cur_silent_token_num += 1
+                            if cur_silent_token_num > max_silent_token_num:
+                                continue
+                        else:
+                            cur_silent_token_num = 0
+                        self.tts_speech_token_dict[uuid].append(i)
+            finally:
+                # a crashed decode generator (OOM/fp16 assert) must still mark
+                # the session done, or streaming consumers poll llm_end forever
                 with self.lock:
-                    if uuid not in self.tts_speech_token_dict:
-                        # Session retired (consumer cancelled); stop decoding
-                        # instead of growing KV cache up to max_len.
-                        break
-                    if i in self.silent_tokens:
-                        cur_silent_token_num += 1
-                        if cur_silent_token_num > max_silent_token_num:
-                            continue
-                    else:
-                        cur_silent_token_num = 0
-                    self.tts_speech_token_dict[uuid].append(i)
-        with self.lock:
-            if uuid in self.llm_end_dict:
-                self.llm_end_dict[uuid] = True
-        # on the retire path the generator is still suspended and references
-        # lm_input/KV tensors, so a release above cannot reclaim them; close
-        # it first (no-op once exhausted) - GeneratorExit also runs the vllm
-        # abort path, then release can actually free the blocks
-        token_generator.close()
+                    if uuid in self.llm_end_dict:
+                        self.llm_end_dict[uuid] = True
+                # on the retire path the generator is still suspended and
+                # references lm_input/KV tensors, so a release below cannot
+                # reclaim them; close it (no-op once exhausted) - GeneratorExit
+                # also runs the vllm abort path
+                token_generator.close()
         # the retiring session's release cannot reclaim blocks this thread
         # still holds (KV tensors); release again once they are dropped
         self._maybe_release_gpu_cache()

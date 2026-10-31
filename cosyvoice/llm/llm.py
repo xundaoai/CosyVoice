@@ -498,8 +498,15 @@ class Qwen2LM(TransformerLM):
         max_len = int((text_len - prompt_text_len) * max_token_text_ratio)
 
         # 5. step by step decode
-        for token in self.inference_wrapper(lm_input, sampling, min_len, max_len, uuid):
-            yield token
+        token_generator = self.inference_wrapper(lm_input, sampling, min_len, max_len, uuid)
+        try:
+            for token in token_generator:
+                yield token
+        finally:
+            # closing this generator (abandoned stream) must run the wrapper's
+            # cleanup (vllm queue pop + engine abort) now, not whenever the
+            # GC finalizes the inner generator
+            token_generator.close()
 
     @torch.inference_mode()
     def inference_wrapper(self, lm_input, sampling, min_len, max_len, uuid):
@@ -519,7 +526,9 @@ class Qwen2LM(TransformerLM):
                         if self.vllm_output_queue[uuid].empty() is True:
                             request_outputs: List[RequestOutput] = self.vllm.step()
                             for request_output in request_outputs:
-                                top_ids = list(request_output.outputs[0].token_ids)[-1]
+                                # index the last token directly; list(...) copies
+                                # the full token history on every step (O(n^2))
+                                top_ids = request_output.outputs[0].token_ids[-1]
                                 # a retired request can still emit here (abort
                                 # races its in-flight step output); putting to
                                 # its popped queue would crash this session
