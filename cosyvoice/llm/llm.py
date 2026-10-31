@@ -520,7 +520,12 @@ class Qwen2LM(TransformerLM):
                             request_outputs: List[RequestOutput] = self.vllm.step()
                             for request_output in request_outputs:
                                 top_ids = list(request_output.outputs[0].token_ids)[-1]
-                                self.vllm_output_queue[request_output.request_id].put(top_ids)
+                                # a retired request can still emit here (abort
+                                # races its in-flight step output); putting to
+                                # its popped queue would crash this session
+                                out_queue = self.vllm_output_queue.get(request_output.request_id)
+                                if out_queue is not None:
+                                    out_queue.put(top_ids)
                     if self.vllm_output_queue[uuid].empty() is False:
                         top_ids = self.vllm_output_queue[uuid].get()
                         if top_ids in self.stop_token_ids:
@@ -538,7 +543,9 @@ class Qwen2LM(TransformerLM):
                     self.vllm_output_queue.pop(uuid, None)
                     abort = getattr(self.vllm, 'abort_request', None)
                     if abort is not None:
-                        abort(uuid)
+                        # vllm V1 abort_request takes list[str]; a bare str is
+                        # iterated per character and aborts nothing
+                        abort([uuid])
         else:
             out_tokens = []
             cache = None

@@ -136,15 +136,23 @@ class CosyVoiceModel:
         with self.lock:
             if uuid in self.llm_end_dict:
                 self.llm_end_dict[uuid] = True
+        # on the retire path the generator is still suspended and references
+        # lm_input/KV tensors, so a release above cannot reclaim them; close
+        # it first (no-op once exhausted) - GeneratorExit also runs the vllm
+        # abort path, then release can actually free the blocks
+        token_generator.close()
         # the retiring session's release cannot reclaim blocks this thread
         # still holds (KV tensors); release again once they are dropped
         self._maybe_release_gpu_cache()
 
     def vc_job(self, source_speech_token, uuid):
+        # flatten().tolist() is a GPU->CPU sync; keep it out of self.lock so
+        # it does not serialize every other session on the model
+        speech_token = source_speech_token.flatten().tolist()
         with self.lock:
             if uuid not in self.llm_end_dict:
                 return
-            self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist()
+            self.tts_speech_token_dict[uuid] = speech_token
             self.llm_end_dict[uuid] = True
         self._maybe_release_gpu_cache()
 
